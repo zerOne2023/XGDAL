@@ -1,5 +1,3 @@
-using NetTopologySuite.Geometries;
-
 namespace XGdal.Shapefile.Domain;
 
 public sealed class FeatureRecord

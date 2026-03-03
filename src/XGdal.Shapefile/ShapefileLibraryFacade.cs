@@ -1,4 +1,3 @@
-using NetTopologySuite.Geometries;
 using XGdal.Shapefile.Abstractions;
 using XGdal.Shapefile.Configuration;
 using XGdal.Shapefile.Domain;
@@ -34,6 +33,18 @@ public sealed class ShapefileLibraryFacade
 
     public Task AppendAsync(string path, IAsyncEnumerable<FeatureRecord> features, string? layerName = null, DataSourceKind kind = DataSourceKind.Shapefile, CancellationToken cancellationToken = default)
         => _repository.AppendAsync(path, features, layerName, kind, cancellationToken);
+
+    public Task<IReadOnlyList<FeatureRecord>> QueryAsync(string path, FeatureQueryOptions? options = null, string? layerName = null, DataSourceKind kind = DataSourceKind.Shapefile, CancellationToken cancellationToken = default)
+        => _repository.QueryAsync(path, options, layerName, kind, cancellationToken);
+
+    public Task<int> UpdateAttributesAsync(string path, IReadOnlyDictionary<string, object?> updates, FeatureQueryOptions? options = null, string? layerName = null, DataSourceKind kind = DataSourceKind.Shapefile, CancellationToken cancellationToken = default)
+        => _repository.UpdateAttributesAsync(path, updates, options, layerName, kind, cancellationToken);
+
+    public Task<int> DeleteFeaturesAsync(string path, FeatureQueryOptions? options = null, string? layerName = null, DataSourceKind kind = DataSourceKind.Shapefile, CancellationToken cancellationToken = default)
+        => _repository.DeleteFeaturesAsync(path, options, layerName, kind, cancellationToken);
+
+    public Task<FieldStatistics> CalculateStatisticsAsync(string path, string fieldName, FeatureQueryOptions? options = null, string? layerName = null, DataSourceKind kind = DataSourceKind.Shapefile, CancellationToken cancellationToken = default)
+        => _repository.CalculateStatisticsAsync(path, fieldName, options, layerName, kind, cancellationToken);
 
     public Geometry Buffer(Geometry geometry, double distance) => _geometry.Buffer(geometry, distance);
     public Geometry Union(IEnumerable<Geometry> geometries) => _geometry.Union(geometries);
