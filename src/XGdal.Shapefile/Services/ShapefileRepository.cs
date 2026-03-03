@@ -46,6 +46,11 @@ public sealed class ShapefileRepository : IShapefileRepository
                 Directory.Delete(dataSourcePath, true);
             }
 
+            if (File.Exists(dataSourcePath))
+            {
+                File.Delete(dataSourcePath);
+            }
+
             return;
         }
 
@@ -129,9 +134,16 @@ public sealed class ShapefileRepository : IShapefileRepository
     {
         EnsureReady();
         ValidatePath(dataSourcePath);
+        ArgumentNullException.ThrowIfNull(schema);
+        ArgumentNullException.ThrowIfNull(features);
 
         options ??= new VectorWriteOptions();
         var kind = options.DataSourceKind;
+
+        if (!options.OverwriteExisting && await ExistsAsync(dataSourcePath, kind, cancellationToken))
+        {
+            throw new ShapefileException($"Data source already exists: {dataSourcePath}");
+        }
 
         if (options.OverwriteExisting)
         {
@@ -230,7 +242,8 @@ public sealed class ShapefileRepository : IShapefileRepository
                     continue;
                 }
 
-                SetFieldValue(feature, fieldIndex, attribute.Value);
+                var fieldType = defn.GetFieldDefn(fieldIndex).GetFieldType();
+                SetFieldValue(feature, fieldIndex, fieldType, attribute.Value);
             }
 
             if (layer.CreateFeature(feature) != 0)
@@ -258,29 +271,45 @@ public sealed class ShapefileRepository : IShapefileRepository
         };
     }
 
-    private static void SetFieldValue(Feature feature, int fieldIndex, object value)
+    private static void SetFieldValue(Feature feature, int fieldIndex, OSGeo.OGR.FieldType fieldType, object value)
     {
-        switch (value)
+        switch (fieldType)
         {
-            case int v:
-                feature.SetField(fieldIndex, v);
+            case OSGeo.OGR.FieldType.OFTInteger:
+                feature.SetField(fieldIndex, Convert.ToInt32(value));
                 break;
-            case long v:
-                feature.SetField(fieldIndex, v);
+            case OSGeo.OGR.FieldType.OFTInteger64:
+                feature.SetField(fieldIndex, Convert.ToInt64(value));
                 break;
-            case double v:
-                feature.SetField(fieldIndex, v);
+            case OSGeo.OGR.FieldType.OFTReal:
+                feature.SetField(fieldIndex, Convert.ToDouble(value));
                 break;
-            case float v:
-                feature.SetField(fieldIndex, (double)v);
+            case OSGeo.OGR.FieldType.OFTDate:
+            {
+                var date = ConvertToDateTime(value);
+                feature.SetField(fieldIndex, date.Year, date.Month, date.Day, 0, 0, 0, 0);
                 break;
-            case bool v:
-                feature.SetField(fieldIndex, v ? 1 : 0);
+            }
+            case OSGeo.OGR.FieldType.OFTDateTime:
+            {
+                var date = ConvertToDateTime(value);
+                feature.SetField(fieldIndex, date.Year, date.Month, date.Day, date.Hour, date.Minute, date.Second, 0);
                 break;
+            }
             default:
                 feature.SetField(fieldIndex, value.ToString() ?? string.Empty);
                 break;
         }
+    }
+
+    private static DateTime ConvertToDateTime(object value)
+    {
+        return value switch
+        {
+            DateTime dateTime => dateTime,
+            DateOnly dateOnly => dateOnly.ToDateTime(TimeOnly.MinValue),
+            _ => DateTime.Parse(value.ToString() ?? string.Empty)
+        };
     }
 
     private static string[] BuildLayerCreationOptions(VectorWriteOptions options, DataSourceKind kind)
