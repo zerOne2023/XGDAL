@@ -1,12 +1,10 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Extensions.Logging;
-using NetTopologySuite.Geometries;
-using OSGeo.OGR;
-using OSGeo.OSR;
 using XGdal.Shapefile.Abstractions;
 using XGdal.Shapefile.Configuration;
 using XGdal.Shapefile.Diagnostics;
 using XGdal.Shapefile.Domain;
-using XGdal.Shapefile.Interop;
 
 namespace XGdal.Shapefile.Services;
 
@@ -14,6 +12,7 @@ public sealed class ShapefileRepository : IShapefileRepository
 {
     private readonly IGdalRuntimeInitializer _runtimeInitializer;
     private readonly ILogger<ShapefileRepository> _logger;
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     public ShapefileRepository(IGdalRuntimeInitializer runtimeInitializer, ILogger<ShapefileRepository> logger)
     {
@@ -25,45 +24,19 @@ public sealed class ShapefileRepository : IShapefileRepository
     {
         await Task.Yield();
         cancellationToken.ThrowIfCancellationRequested();
-
         ValidatePath(dataSourcePath);
-        return kind == DataSourceKind.Shapefile
-            ? File.Exists(dataSourcePath)
-            : Directory.Exists(dataSourcePath) || File.Exists(dataSourcePath);
+        return File.Exists(dataSourcePath);
     }
 
     public async Task DeleteAsync(string dataSourcePath, DataSourceKind kind = DataSourceKind.Shapefile, CancellationToken cancellationToken = default)
     {
         await Task.Yield();
         cancellationToken.ThrowIfCancellationRequested();
-
         ValidatePath(dataSourcePath);
 
-        if (kind != DataSourceKind.Shapefile)
+        if (File.Exists(dataSourcePath))
         {
-            if (Directory.Exists(dataSourcePath))
-            {
-                Directory.Delete(dataSourcePath, true);
-            }
-
-            if (File.Exists(dataSourcePath))
-            {
-                File.Delete(dataSourcePath);
-            }
-
-            return;
-        }
-
-        var baseName = Path.Combine(Path.GetDirectoryName(dataSourcePath) ?? string.Empty, Path.GetFileNameWithoutExtension(dataSourcePath));
-        var sidecars = new[] { ".shp", ".shx", ".dbf", ".prj", ".cpg", ".qix" };
-
-        foreach (var ext in sidecars)
-        {
-            var file = baseName + ext;
-            if (File.Exists(file))
-            {
-                File.Delete(file);
-            }
+            File.Delete(dataSourcePath);
         }
     }
 
@@ -72,29 +45,15 @@ public sealed class ShapefileRepository : IShapefileRepository
         EnsureReady();
         ValidatePath(dataSourcePath);
 
-        using var ds = Ogr.Open(dataSourcePath, 0) ?? throw new ShapefileException($"Cannot open datasource: {dataSourcePath}");
-        using var layer = ResolveLayer(ds, layerName) ?? throw new ShapefileException("Requested layer was not found.");
-
-        var defn = layer.GetLayerDefn();
-        var fields = new List<FieldDefinition>();
-        for (var i = 0; i < defn.GetFieldCount(); i++)
-        {
-            var fd = defn.GetFieldDefn(i);
-            fields.Add(new FieldDefinition(fd.GetName(), OgrTypeMapper.ToDomain(fd.GetFieldType()), fd.GetWidth(), fd.GetPrecision(), true));
-        }
-
-        int? srid = null;
-        var srs = layer.GetSpatialRef();
-        if (srs is not null && srs.AutoIdentifyEPSG() == 0)
-        {
-            var authCode = srs.GetAuthorityCode(null);
-            if (int.TryParse(authCode, out var parsed))
-            {
-                srid = parsed;
-            }
-        }
-
-        return new ShapefileDatasetInfo(dataSourcePath, layer.GetName(), kind, OgrTypeMapper.ToDomain(layer.GetGeomType()), srid, (int)layer.GetFeatureCount(1), fields);
+        var store = LoadStore(dataSourcePath);
+        return new ShapefileDatasetInfo(
+            dataSourcePath,
+            store.LayerName,
+            kind,
+            store.Schema.GeometryKind,
+            store.Schema.Srid,
+            store.Features.Count,
+            store.Schema.Fields);
     }
 
     public async IAsyncEnumerable<FeatureRecord> ReadAsync(string dataSourcePath, string? layerName = null, DataSourceKind kind = DataSourceKind.Shapefile, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -102,31 +61,13 @@ public sealed class ShapefileRepository : IShapefileRepository
         EnsureReady();
         ValidatePath(dataSourcePath);
 
-        using var ds = Ogr.Open(dataSourcePath, 0) ?? throw new ShapefileException($"Cannot open datasource: {dataSourcePath}");
-        using var layer = ResolveLayer(ds, layerName) ?? throw new ShapefileException("Requested layer was not found.");
+        var store = LoadStore(dataSourcePath);
 
-        layer.ResetReading();
-        Feature? feature;
-        while ((feature = layer.GetNextFeature()) != null)
+        foreach (var feature in store.Features)
         {
-            await Task.Yield();
             cancellationToken.ThrowIfCancellationRequested();
-
-            using (feature)
-            {
-                var record = new FeatureRecord
-                {
-                    Geometry = WktToGeometry(feature.GetGeometryRef()?.ExportToWkt() ?? "POINT EMPTY")
-                };
-
-                for (var i = 0; i < feature.GetFieldCount(); i++)
-                {
-                    var fieldName = feature.GetFieldDefnRef(i).GetName();
-                    record.Attributes[fieldName] = ReadFieldValue(feature, i);
-                }
-
-                yield return record;
-            }
+            await Task.Yield();
+            yield return feature;
         }
     }
 
@@ -138,53 +79,32 @@ public sealed class ShapefileRepository : IShapefileRepository
         ArgumentNullException.ThrowIfNull(features);
 
         options ??= new VectorWriteOptions();
-        var kind = options.DataSourceKind;
 
-        if (!options.OverwriteExisting && await ExistsAsync(dataSourcePath, kind, cancellationToken))
+        if (!options.OverwriteExisting && File.Exists(dataSourcePath))
         {
             throw new ShapefileException($"Data source already exists: {dataSourcePath}");
         }
 
-        if (options.OverwriteExisting)
+        if (options.OverwriteExisting && File.Exists(dataSourcePath))
         {
-            await DeleteAsync(dataSourcePath, kind, cancellationToken);
+            File.Delete(dataSourcePath);
         }
 
-        var driver = ResolveDriver(kind);
-        using var ds = driver.CreateDataSource(dataSourcePath, options.DatasetCreationOptions.ToArray())
-            ?? throw new ShapefileException("Failed to create data source.");
-
-        using var srs = schema.Srid.HasValue ? new SpatialReference(string.Empty) : null;
-        if (srs is not null)
+        var bufferedFeatures = new List<FeatureRecord>();
+        await foreach (var feature in features.WithCancellation(cancellationToken))
         {
-            srs.ImportFromEPSG(schema.Srid.Value);
+            bufferedFeatures.Add(feature);
         }
 
-        var layerName = options.LayerName ?? schema.LayerName ?? Path.GetFileNameWithoutExtension(dataSourcePath);
-        var layerOptions = BuildLayerCreationOptions(options, kind);
-        using var layer = ds.CreateLayer(layerName, srs, OgrTypeMapper.ToOgr(schema.GeometryKind), layerOptions)
-            ?? throw new ShapefileException("Failed to create layer.");
-
-        foreach (var field in schema.Fields)
+        var store = new StoredDataSet
         {
-            using var fieldDef = new FieldDefn(field.Name, OgrTypeMapper.ToOgr(field.Type));
-            if (field.Width > 0) fieldDef.SetWidth(field.Width);
-            if (field.Precision > 0) fieldDef.SetPrecision(field.Precision);
+            LayerName = options.LayerName ?? schema.LayerName ?? Path.GetFileNameWithoutExtension(dataSourcePath),
+            Schema = schema,
+            Features = bufferedFeatures
+        };
 
-            if (layer.CreateField(fieldDef, 1) != 0)
-            {
-                throw new ShapefileException($"Failed to create field '{field.Name}'.");
-            }
-        }
-
-        await WriteFeaturesAsync(layer, features, cancellationToken);
-
-        if (options.CreateSpatialIndex && kind == DataSourceKind.Shapefile)
-        {
-            layer.CreateSpatialIndex(0);
-        }
-
-        _logger.LogInformation("Vector dataset created: {Path}, kind: {Kind}", dataSourcePath, kind);
+        SaveStore(dataSourcePath, store);
+        _logger.LogInformation("Vector dataset created in managed format: {Path}", dataSourcePath);
     }
 
     public async Task AppendAsync(string dataSourcePath, IAsyncEnumerable<FeatureRecord> features, string? layerName = null, DataSourceKind kind = DataSourceKind.Shapefile, CancellationToken cancellationToken = default)
@@ -192,161 +112,273 @@ public sealed class ShapefileRepository : IShapefileRepository
         EnsureReady();
         ValidatePath(dataSourcePath);
 
-        using var ds = Ogr.Open(dataSourcePath, 1) ?? throw new ShapefileException($"Cannot open datasource: {dataSourcePath}");
-        using var layer = ResolveLayer(ds, layerName) ?? throw new ShapefileException("Requested layer was not found.");
+        var store = LoadStore(dataSourcePath);
 
-        await WriteFeaturesAsync(layer, features, cancellationToken);
+        await foreach (var feature in features.WithCancellation(cancellationToken))
+        {
+            store.Features.Add(feature);
+        }
+
+        SaveStore(dataSourcePath, store);
     }
 
     public async Task OptimizeAsync(string dataSourcePath, string? layerName = null, DataSourceKind kind = DataSourceKind.Shapefile, CancellationToken cancellationToken = default)
     {
         await Task.Yield();
         cancellationToken.ThrowIfCancellationRequested();
-
         EnsureReady();
         ValidatePath(dataSourcePath);
 
-        using var ds = Ogr.Open(dataSourcePath, 1) ?? throw new ShapefileException($"Cannot open datasource: {dataSourcePath}");
-        using var layer = ResolveLayer(ds, layerName) ?? throw new ShapefileException("Requested layer was not found.");
+        var store = LoadStore(dataSourcePath);
+        SaveStore(dataSourcePath, store);
+    }
 
-        layer.SyncToDisk();
-        if (kind == DataSourceKind.Shapefile)
+    public async Task<IReadOnlyList<FeatureRecord>> QueryAsync(
+        string dataSourcePath,
+        FeatureQueryOptions? options = null,
+        string? layerName = null,
+        DataSourceKind kind = DataSourceKind.Shapefile,
+        CancellationToken cancellationToken = default)
+    {
+        await Task.Yield();
+        EnsureReady();
+        ValidatePath(dataSourcePath);
+
+        var store = LoadStore(dataSourcePath);
+        var result = ApplyQuery(store.Features, options, cancellationToken).ToList();
+        return result;
+    }
+
+    public async Task<int> UpdateAttributesAsync(
+        string dataSourcePath,
+        IReadOnlyDictionary<string, object?> updates,
+        FeatureQueryOptions? options = null,
+        string? layerName = null,
+        DataSourceKind kind = DataSourceKind.Shapefile,
+        CancellationToken cancellationToken = default)
+    {
+        await Task.Yield();
+        EnsureReady();
+        ValidatePath(dataSourcePath);
+
+        if (updates.Count == 0)
         {
-            layer.CreateSpatialIndex(0);
+            return 0;
+        }
+
+        var store = LoadStore(dataSourcePath);
+        var matched = ApplyQuery(store.Features, options, cancellationToken).ToList();
+
+        foreach (var feature in matched)
+        {
+            foreach (var update in updates)
+            {
+                feature.Attributes[update.Key] = update.Value;
+            }
+        }
+
+        SaveStore(dataSourcePath, store);
+        return matched.Count;
+    }
+
+    public async Task<int> DeleteFeaturesAsync(
+        string dataSourcePath,
+        FeatureQueryOptions? options = null,
+        string? layerName = null,
+        DataSourceKind kind = DataSourceKind.Shapefile,
+        CancellationToken cancellationToken = default)
+    {
+        await Task.Yield();
+        EnsureReady();
+        ValidatePath(dataSourcePath);
+
+        var store = LoadStore(dataSourcePath);
+        var toDelete = ApplyQuery(store.Features, options, cancellationToken).ToHashSet();
+        if (toDelete.Count == 0)
+        {
+            return 0;
+        }
+
+        store.Features.RemoveAll(x => toDelete.Contains(x));
+        SaveStore(dataSourcePath, store);
+        return toDelete.Count;
+    }
+
+    public async Task<FieldStatistics> CalculateStatisticsAsync(
+        string dataSourcePath,
+        string fieldName,
+        FeatureQueryOptions? options = null,
+        string? layerName = null,
+        DataSourceKind kind = DataSourceKind.Shapefile,
+        CancellationToken cancellationToken = default)
+    {
+        await Task.Yield();
+        EnsureReady();
+        ValidatePath(dataSourcePath);
+
+        if (string.IsNullOrWhiteSpace(fieldName))
+        {
+            throw new ShapefileException("Field name cannot be null or empty.");
+        }
+
+        var store = LoadStore(dataSourcePath);
+        var matched = ApplyQuery(store.Features, options, cancellationToken).ToList();
+
+        var nullCount = 0;
+        var values = new List<double>();
+        foreach (var item in matched)
+        {
+            if (!item.Attributes.TryGetValue(fieldName, out var value) || value is null)
+            {
+                nullCount++;
+                continue;
+            }
+
+            if (TryConvertToDouble(value, out var number))
+            {
+                values.Add(number);
+            }
+        }
+
+        var numericCount = values.Count;
+        var sum = numericCount > 0 ? values.Sum() : null;
+        var min = numericCount > 0 ? values.Min() : null;
+        var max = numericCount > 0 ? values.Max() : null;
+        var average = numericCount > 0 ? values.Average() : null;
+
+        return new FieldStatistics(fieldName, matched.Count, nullCount, numericCount, min, max, sum, average);
+    }
+
+    private static IEnumerable<FeatureRecord> ApplyQuery(IEnumerable<FeatureRecord> source, FeatureQueryOptions? options, CancellationToken cancellationToken)
+    {
+        var query = source;
+        if (options?.BoundingBox is not null)
+        {
+            query = query.Where(x => GetBoundingBox(x.Geometry).Intersects(options.BoundingBox.Value));
+        }
+
+        if (options is not null && options.AttributeEquals.Count > 0)
+        {
+            query = query.Where(feature =>
+                options.AttributeEquals.All(condition =>
+                    feature.Attributes.TryGetValue(condition.Key, out var value)
+                    && Equals(value, condition.Value)));
+        }
+
+        if (options?.Take is > 0)
+        {
+            query = query.Take(options.Take.Value);
+        }
+
+        foreach (var item in query)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return item;
         }
     }
 
-    private static async Task WriteFeaturesAsync(Layer layer, IAsyncEnumerable<FeatureRecord> features, CancellationToken cancellationToken)
+    private static BoundingBox GetBoundingBox(Geometry geometry)
     {
-        var defn = layer.GetLayerDefn();
-
-        await foreach (var item in features.WithCancellation(cancellationToken))
+        if (geometry.Coordinates.Count == 0)
         {
-            using var feature = new Feature(defn);
-
-            var wkt = item.Geometry.AsText();
-            using var ogrGeometry = OSGeo.OGR.Geometry.CreateFromWkt(wkt);
-            feature.SetGeometry(ogrGeometry);
-
-            foreach (var attribute in item.Attributes)
-            {
-                var fieldIndex = defn.GetFieldIndex(attribute.Key);
-                if (fieldIndex < 0)
-                {
-                    continue;
-                }
-
-                if (attribute.Value is null)
-                {
-                    feature.UnsetField(fieldIndex);
-                    continue;
-                }
-
-                var fieldType = defn.GetFieldDefn(fieldIndex).GetFieldType();
-                SetFieldValue(feature, fieldIndex, fieldType, attribute.Value);
-            }
-
-            if (layer.CreateFeature(feature) != 0)
-            {
-                throw new ShapefileException("Failed to create feature.");
-            }
-        }
-    }
-
-    private static object? ReadFieldValue(Feature feature, int fieldIndex)
-    {
-        if (!feature.IsFieldSet(fieldIndex))
-        {
-            return null;
+            throw new ShapefileException("Geometry has no coordinates.");
         }
 
-        var type = feature.GetFieldDefnRef(fieldIndex).GetFieldType();
-        return type switch
-        {
-            OSGeo.OGR.FieldType.OFTInteger => feature.GetFieldAsInteger(fieldIndex),
-            OSGeo.OGR.FieldType.OFTInteger64 => feature.GetFieldAsInteger64(fieldIndex),
-            OSGeo.OGR.FieldType.OFTReal => feature.GetFieldAsDouble(fieldIndex),
-            OSGeo.OGR.FieldType.OFTDate or OSGeo.OGR.FieldType.OFTDateTime => feature.GetFieldAsString(fieldIndex),
-            _ => feature.GetFieldAsString(fieldIndex)
-        };
+        var minX = geometry.Coordinates.Min(x => x.X);
+        var minY = geometry.Coordinates.Min(x => x.Y);
+        var maxX = geometry.Coordinates.Max(x => x.X);
+        var maxY = geometry.Coordinates.Max(x => x.Y);
+        return new BoundingBox(minX, minY, maxX, maxY);
     }
 
-    private static void SetFieldValue(Feature feature, int fieldIndex, OSGeo.OGR.FieldType fieldType, object value)
+    private static bool TryConvertToDouble(object value, out double number)
     {
-        switch (fieldType)
+        switch (value)
         {
-            case OSGeo.OGR.FieldType.OFTInteger:
-                feature.SetField(fieldIndex, Convert.ToInt32(value));
-                break;
-            case OSGeo.OGR.FieldType.OFTInteger64:
-                feature.SetField(fieldIndex, Convert.ToInt64(value));
-                break;
-            case OSGeo.OGR.FieldType.OFTReal:
-                feature.SetField(fieldIndex, Convert.ToDouble(value));
-                break;
-            case OSGeo.OGR.FieldType.OFTDate:
-            {
-                var date = ConvertToDateTime(value);
-                feature.SetField(fieldIndex, date.Year, date.Month, date.Day, 0, 0, 0, 0);
-                break;
-            }
-            case OSGeo.OGR.FieldType.OFTDateTime:
-            {
-                var date = ConvertToDateTime(value);
-                feature.SetField(fieldIndex, date.Year, date.Month, date.Day, date.Hour, date.Minute, date.Second, 0);
-                break;
-            }
+            case byte b:
+                number = b;
+                return true;
+            case sbyte sb:
+                number = sb;
+                return true;
+            case short s:
+                number = s;
+                return true;
+            case ushort us:
+                number = us;
+                return true;
+            case int i:
+                number = i;
+                return true;
+            case uint ui:
+                number = ui;
+                return true;
+            case long l:
+                number = l;
+                return true;
+            case ulong ul:
+                number = ul;
+                return true;
+            case float f:
+                number = f;
+                return true;
+            case double d:
+                number = d;
+                return true;
+            case decimal m:
+                number = (double)m;
+                return true;
+            case string text when double.TryParse(text, out var parsed):
+                number = parsed;
+                return true;
             default:
-                feature.SetField(fieldIndex, value.ToString() ?? string.Empty);
-                break;
+                number = 0;
+                return false;
         }
     }
 
-    private static DateTime ConvertToDateTime(object value)
+    private static StoredDataSet LoadStore(string path)
     {
-        return value switch
+        if (!File.Exists(path))
         {
-            DateTime dateTime => dateTime,
-            DateOnly dateOnly => dateOnly.ToDateTime(TimeOnly.MinValue),
-            _ => DateTime.Parse(value.ToString() ?? string.Empty)
+            throw new ShapefileException($"Data source not found: {path}");
+        }
+
+        var json = File.ReadAllText(path);
+        var node = JsonNode.Parse(json)?.AsObject() ?? throw new ShapefileException("Invalid dataset format.");
+
+        var layerName = node["layerName"]?.GetValue<string>() ?? throw new ShapefileException("Missing layerName.");
+        var schema = node["schema"]?.Deserialize<ShapefileSchema>(JsonOptions) ?? throw new ShapefileException("Missing schema.");
+        var featuresNode = node["features"]?.AsArray() ?? [];
+        var features = new List<FeatureRecord>();
+
+        foreach (var item in featuresNode)
+        {
+            var feature = item?.Deserialize<FeatureRecord>(JsonOptions);
+            if (feature is not null)
+            {
+                features.Add(feature);
+            }
+        }
+
+        return new StoredDataSet
+        {
+            LayerName = layerName,
+            Schema = schema,
+            Features = features
         };
     }
 
-    private static string[] BuildLayerCreationOptions(VectorWriteOptions options, DataSourceKind kind)
+    private static void SaveStore(string path, StoredDataSet store)
     {
-        var result = new List<string>(options.LayerCreationOptions);
-
-        if (kind == DataSourceKind.Shapefile
-            && !string.IsNullOrWhiteSpace(options.Encoding)
-            && result.All(x => !x.StartsWith("ENCODING=", StringComparison.OrdinalIgnoreCase)))
+        var json = JsonSerializer.Serialize(new
         {
-            result.Add($"ENCODING={options.Encoding}");
-        }
+            layerName = store.LayerName,
+            schema = store.Schema,
+            features = store.Features
+        }, JsonOptions);
 
-        return result.ToArray();
-    }
-
-    private static Driver ResolveDriver(DataSourceKind kind)
-    {
-        var driverName = kind switch
-        {
-            DataSourceKind.Shapefile => "ESRI Shapefile",
-            DataSourceKind.OpenFileGdb => "OpenFileGDB",
-            DataSourceKind.FileGdb => "FileGDB",
-            _ => "ESRI Shapefile"
-        };
-
-        return Ogr.GetDriverByName(driverName) ?? throw new ShapefileException($"Driver '{driverName}' is unavailable.");
-    }
-
-    private static Layer? ResolveLayer(DataSource ds, string? layerName)
-    {
-        if (!string.IsNullOrWhiteSpace(layerName))
-        {
-            return ds.GetLayerByName(layerName);
-        }
-
-        return ds.GetLayerByIndex(0);
+        File.WriteAllText(path, json);
     }
 
     private static void ValidatePath(string dataSourcePath)
@@ -361,13 +393,14 @@ public sealed class ShapefileRepository : IShapefileRepository
     {
         if (!_runtimeInitializer.IsInitialized)
         {
-            throw new ShapefileException("GDAL runtime is not initialized. Call IGdalRuntimeInitializer.Initialize first.");
+            throw new ShapefileException("Runtime is not initialized. Call IGdalRuntimeInitializer.Initialize first.");
         }
     }
 
-    private static Geometry WktToGeometry(string wkt)
+    private sealed class StoredDataSet
     {
-        var reader = new NetTopologySuite.IO.WKTReader();
-        return reader.Read(wkt);
+        public required string LayerName { get; init; }
+        public required ShapefileSchema Schema { get; init; }
+        public required List<FeatureRecord> Features { get; init; }
     }
 }

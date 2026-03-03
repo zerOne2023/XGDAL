@@ -1,6 +1,4 @@
 using Microsoft.Extensions.Logging;
-using OSGeo.GDAL;
-using OSGeo.OGR;
 using XGdal.Shapefile.Abstractions;
 using XGdal.Shapefile.Configuration;
 
@@ -32,28 +30,7 @@ public sealed class GdalRuntimeInitializer : IGdalRuntimeInitializer
                 return;
             }
 
-            if (!string.IsNullOrWhiteSpace(options.GdalDataPath))
-            {
-                Gdal.SetConfigOption("GDAL_DATA", options.GdalDataPath);
-            }
-
-            if (!string.IsNullOrWhiteSpace(options.ProjLibPath))
-            {
-                Gdal.SetConfigOption("PROJ_LIB", options.ProjLibPath);
-            }
-
-            foreach (var item in options.ConfigOptions)
-            {
-                Gdal.SetConfigOption(item.Key, item.Value);
-            }
-
-            if (options.RegisterAllDrivers)
-            {
-                Gdal.AllRegister();
-                Ogr.RegisterAll();
-            }
-
-            _logger.LogInformation("GDAL runtime initialized.");
+            _logger.LogInformation("Runtime initialized in pure managed mode (no GDAL dependency).");
             IsInitialized = true;
         }
     }

@@ -1,74 +1,41 @@
-# XGdal Shapefile / GDB Library (for C#/WPF)
+# XGdal Shapefile / GDB Library (Pure Managed Skeleton)
 
-这是一个面向大型软件架构设计的矢量数据类库骨架，基于 GDAL/OGR + NetTopologySuite，强调：
+这是一个**从零开始**实现的矢量数据类库骨架：
 
-- 分层清晰（Abstractions / Domain / Services / Interop / Extensions）。
-- 接口丰富（读、写、追加、优化、元数据查询、存在性检测、删除、几何运算）。
-- 便于 WPF + DI 调用（`AddXGdalShapefile` 扩展）。
-- 支持可配置运行时初始化（`GdalRuntimeOptions`）。
-- 支持 **SHP** 与 **GDB（OpenFileGDB / FileGDB）** 驱动。
+- 参考 GDAL 的分层设计思路（Reader/Writer/Repository/Geometry Service）。
+- **不依赖 GDAL、NetTopologySuite 等第三方 GIS 库**。
+- 提供可扩展的领域模型（`Geometry`、`FeatureRecord`、`ShapefileSchema`）。
+- 当前以托管 JSON 存储格式实现读写流程，便于先完成架构和业务闭环。
 
-## 关键能力
+## 当前能力（ArcGIS 常见工作流对应）
 
-- `DataSourceKind`：在 SHP、OpenFileGDB、FileGDB 之间切换。
-- `VectorWriteOptions`：同时支持图层参数和数据集参数。
-- `GetInfo/ReadAsync/AppendAsync`：支持传入 `layerName`，适配 GDB 多图层（Feature Class）场景。
-- `IGeometryOperationsService`：支持 Buffer、Union、Intersection、Difference、Simplify、Contains/Within/Intersects、Distance 等几何计算。
+- 数据读写：`WriteAsync / ReadAsync / AppendAsync / GetInfo / ExistsAsync / DeleteAsync`。
+- 属性查询（Select By Attributes）：`QueryAsync` + `FeatureQueryOptions.AttributeEquals`。
+- 空间查询（Select By Location 简化版）：`QueryAsync` + `FeatureQueryOptions.BoundingBox`。
+- 批量字段更新（Calculate Field）：`UpdateAttributesAsync`。
+- 要素删除（Delete Features）：`DeleteFeaturesAsync`。
+- 统计分析（Summary Statistics）：`CalculateStatisticsAsync`。
+- 基础几何分析：`Buffer / Area / Length / Distance / Intersects / Contains / Within`。
 
-## WPF 调用示例（写入 GDB + 几何运算）
+## 设计目标
+
+后续可在不破坏对外接口的前提下，逐步替换为真正的 SHP/DBF/SHX 二进制实现（或自研 GDB 解析模块）。
+
+## 示例
 
 ```csharp
-using Microsoft.Extensions.DependencyInjection;
-using NetTopologySuite.Geometries;
-using XGdal.Shapefile;
-using XGdal.Shapefile.Abstractions;
-using XGdal.Shapefile.Configuration;
-using XGdal.Shapefile.Domain;
-using XGdal.Shapefile.Extensions;
-
-var services = new ServiceCollection();
-services.AddLogging();
-services.AddXGdalShapefile();
-
-using var provider = services.BuildServiceProvider();
-var facade = new ShapefileLibraryFacade(
-    provider.GetRequiredService<IGdalRuntimeInitializer>(),
-    provider.GetRequiredService<IShapefileRepository>(),
-    provider.GetRequiredService<IGeometryOperationsService>());
-
-facade.Initialize(new GdalRuntimeOptions
+var query = new FeatureQueryOptions
 {
-    GdalDataPath = @"C:\gdal-data",
-    ProjLibPath = @"C:\projlib"
-});
-
-var schema = new ShapefileSchema
-{
-    GeometryKind = GeometryKind.Point,
-    Srid = 4326,
-    LayerName = "cities"
+    BoundingBox = new BoundingBox(116.0, 39.0, 117.0, 40.0),
+    AttributeEquals = { ["Category"] = "City" },
+    Take = 100
 };
-schema.Fields.Add(new FieldDefinition("Name", FieldType.String, 50));
 
-async IAsyncEnumerable<FeatureRecord> BuildFeatures()
-{
-    yield return new FeatureRecord
-    {
-        Geometry = new Point(116.39, 39.90),
-        Attributes = { ["Name"] = "Beijing" }
-    };
-}
+var selected = await facade.QueryAsync("D:/data/cities.json", query);
+var updated = await facade.UpdateAttributesAsync(
+    "D:/data/cities.json",
+    new Dictionary<string, object?> { ["Reviewed"] = true },
+    query);
 
-await facade.WriteAsync(
-    @"D:\data\cities.gdb",
-    schema,
-    BuildFeatures(),
-    new VectorWriteOptions
-    {
-        DataSourceKind = DataSourceKind.OpenFileGdb,
-        LayerName = "cities"
-    });
-
-var buffered = facade.Buffer(new Point(116.39, 39.90), 0.1);
-var area = facade.Area(buffered);
+var stats = await facade.CalculateStatisticsAsync("D:/data/cities.json", "Population", query);
 ```

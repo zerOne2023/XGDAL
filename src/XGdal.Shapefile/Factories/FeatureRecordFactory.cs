@@ -1,4 +1,3 @@
-using NetTopologySuite.Geometries;
 using XGdal.Shapefile.Domain;
 
 namespace XGdal.Shapefile.Factories;
